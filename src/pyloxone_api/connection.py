@@ -9,11 +9,13 @@ import asyncio
 import datetime
 import hashlib
 import inspect
+import ipaddress
 import json
 import logging
 import ssl
 import time
 import urllib
+import uuid
 from base64 import b64decode, b64encode
 from collections import deque
 from collections.abc import Awaitable, Callable
@@ -26,6 +28,7 @@ import aiohttp
 import websockets as wslib
 import websockets.exceptions
 import random
+import re
 from Crypto.Cipher import AES, PKCS1_v1_5
 from Crypto.Hash import HMAC, SHA1, SHA256
 from Crypto.PublicKey import RSA
@@ -39,19 +42,26 @@ from .const import (AES_KEY_SIZE, CMD_AUTH_WITH_TOKEN, CMD_CHECK_TOKEN, CMD_ENAB
                     CMD_KEY_EXCHANGE, CMD_KILL_TOKEN, CMD_REFRESH_TOKEN,
                     CMD_REFRESH_TOKEN_JSON_WEB, CMD_REQUEST_TOKEN,
                     CMD_REQUEST_TOKEN_JSON_WEB, IV_BYTES, KEEP_ALIVE_PERIOD, LLRSP_UNAUTHORISED_CODES,
-                    LOXAPPPATH, MAX_RECONNECT_DELAY, MAX_REFRESH_DELAY,
+                    CMD_GET_STRUCTURE_FILE, CMD_GET_STRUCTURE_VERSION,
+                    MAX_RECONNECT_DELAY, MAX_REFRESH_DELAY,
                     MAX_WEBSOCKET_MESSAGE_SIZE, MESSAGE_HEADER_SIZE,
                     RECONNECT_DELAY, RECONNECT_TRIES, SALT_BYTES,
                     SALT_MAX_AGE_SECONDS, SALT_MAX_USE_COUNT,
-                    SECURED_COMMAND_TIMEOUT, TIMEOUT,
-                    TOKEN_PERMISSION, TOKEN_REFRESH_MAX_FAILURES,
+                    SECURED_COMMAND_TIMEOUT, STRUCTURE_FILE_TIMEOUT,
+                    STRUCTURE_VERSION_TIMEOUT, TIMEOUT,
+                    DEFAULT_CLIENT_INFO, TOKEN_PERMISSION, TOKEN_PERMISSION_APP,
+                    TOKEN_PERMISSION_WEB, TOKEN_REFRESH_MAX_FAILURES,
                     WEBSOCKET_CLOSE_TIMEOUT, WEBSOCKET_READ_TIMEOUT)
-from .token_store import TokenStore, make_binding, token_from_store
+from .structure_cache import StructureCache, cached_structure_for
+from .token_store import (TokenStore, client_uuid_from_store, is_loxone_uuid,
+                          make_binding, normalise_pin, pin_from_store,
+                          token_from_store)
 from .exceptions import (LoxoneAuthEscalatedError,
                          LoxoneNoEventSlotsError, LoxoneRemoteAccessDeniedError,
                          LoxoneConnectionClosedOk, LoxoneConnectionError,
                          LoxoneException, LoxoneMaxNumOfConnectionsError,
                          LoxoneOutOfServiceException,
+                         LoxonePublicKeyMismatchError,
                          LoxoneServiceUnAvailableError, LoxoneTokenError,
                          LoxoneUnauthorisedError)
 from .loxone_http_client import LoxoneAsyncHttpClient
@@ -118,6 +128,11 @@ def is_auth_response(message: BaseMessage) -> bool:
         control = control.decode("utf-8", errors="replace")
     # jdev/sys/<cmd>/..., dev/sys/<cmd>/... or a bare <cmd>/... (authwithtoken)
     return not _AUTH_COMMANDS.isdisjoint(str(control).split("/")[:3])
+
+
+# Start of a command reply ({"LL": ...}). A text message that does not start
+# like this is a file, e.g. the structure file.
+_LL_ENVELOPE = re.compile(r'\s*\{\s*"LL"\s*:')
 
 
 # Pre-computed ``create_task`` names for the recv hot path. Building
@@ -377,6 +392,11 @@ class LoxoneBaseConnection:
         token_change_callback: Optional[Callable[..., Any]] = None,
         token_store: Optional[TokenStore] = None,
         forward_daytimer_weather: bool = False,
+        client_uuid: Optional[str] = None,
+        client_info: str = DEFAULT_CLIENT_INFO,
+        token_permission: int = TOKEN_PERMISSION,
+        structure_cache: Optional[StructureCache] = None,
+        public_key_pin: Optional[str] = None,
     ):
         # Validate input parameters
         if not host or not isinstance(host, str):
@@ -397,6 +417,31 @@ class LoxoneBaseConnection:
             raise ValueError("verify_ssl must be a boolean")
         if not isinstance(forward_daytimer_weather, bool):
             raise ValueError("forward_daytimer_weather must be a boolean")
+        if client_uuid is not None and not is_loxone_uuid(client_uuid):
+            raise ValueError(
+                "client_uuid must have the form 8-4-4-16 hex digits, "
+                "e.g. 098802e1-02b4-603c-ffffeee000d80cfd"
+            )
+        if not isinstance(client_info, str) or not client_info:
+            raise ValueError("client_info must be a non-empty string")
+        if isinstance(token_permission, bool) or token_permission not in (
+            TOKEN_PERMISSION_WEB,
+            TOKEN_PERMISSION_APP,
+        ):
+            raise ValueError(
+                f"token_permission must be {TOKEN_PERMISSION_WEB} (web) or "
+                f"{TOKEN_PERMISSION_APP} (app), got {token_permission!r}"
+            )
+        if structure_cache is not None and not (
+            callable(getattr(structure_cache, "load", None))
+            and callable(getattr(structure_cache, "save", None))
+        ):
+            raise ValueError("structure_cache needs load() and save() methods")
+        self._structure_cache: Optional[StructureCache] = structure_cache
+        if public_key_pin is not None and normalise_pin(public_key_pin) is None:
+            raise ValueError(
+                "public_key_pin must be 'sha256:' followed by 64 hex digits"
+            )
 
         self.host = host
         self.username = username
@@ -489,6 +534,8 @@ class LoxoneBaseConnection:
             parsed = urlparse(host if "://" in host else f"//{host}", scheme="")
             self.scheme = parsed.scheme or ("https" if port == 443 else "http")
             netloc = parsed.hostname or parsed.path
+            # Bare host name or IP (no port, no brackets), for tls_hostname.
+            self._hostname: str = netloc
 
             if not netloc:
                 raise ValueError(f"Cannot parse hostname from '{host}'")
@@ -518,6 +565,10 @@ class LoxoneBaseConnection:
 
         self.miniserver_version: list[int] = []
         self.miniserver_serial: str = ""
+        # ``httpsStatus`` from apiKey (spec "Using HTTPS/WSS"): 1 = TLS
+        # available, 2 = certificate expired, 0 = none, None = unknown.
+        self.https_status: int | None = None
+        self._https_hint_logged: bool = False
         self.structure_file: dict = {}
         # Set by ``open(connect_websocket=False)``: the HTTP bootstrap
         # (apiKey / LoxAPP3 / publicKey / session key) is done, but the
@@ -525,6 +576,19 @@ class LoxoneBaseConnection:
         # before the key exchange. Issue #527: the Miniserver closes a
         # websocket that is not authenticated within a few seconds.
         self._websocket_deferred: bool = False
+        # Structure file over the websocket (see ``_after_login``):
+        # ``_bootstrap_session`` marks the short session of ``open()``,
+        # which sets ``_bootstrap_done`` once the file is loaded.
+        # ``_structure_fresh`` lets the next listening session skip the
+        # download it just did. ``_structure_waiter`` receives the raw
+        # text message of the file from the recv loop.
+        self._bootstrap_session: bool = False
+        self._bootstrap_done: Optional[asyncio.Event] = None
+        self._bootstrap_error: Optional[Exception] = None
+        self._structure_fresh: bool = False
+        self._structure_waiter: Optional[asyncio.Future] = None
+        # Receives the reply to ``jdev/sps/LoxAPPversion3``.
+        self._version_waiter: Optional[asyncio.Future] = None
 
         # Validate and initialize token
         try:
@@ -573,6 +637,26 @@ class LoxoneBaseConnection:
         if token is None and token_store is not None:
             self._token = self._load_from_token_store()
 
+        # Identifies this client in the Miniserver's token list (spec:
+        # derived from the device identity, or generated and stored). It
+        # is saved with the token, so a restart keeps it.
+        self.client_info = client_info
+        self.token_permission = token_permission
+        self.client_uuid: str = (
+            client_uuid
+            or self._stored_client_uuid(token)
+            or self._new_client_uuid()
+        )
+
+        # Pinned Miniserver public key (trust on first use). The spec asks
+        # to verify the certificate against the Loxone root certificate,
+        # which Loxone does not publish; pinning the first key seen at
+        # least detects a different key later.
+        self.public_key_pin: Optional[str] = (
+            normalise_pin(public_key_pin) if public_key_pin is not None
+            else self._stored_pin(token)
+        )
+
         self._key: str = ""
         self._user_salt: str = ""
         self._hash_alg: str = ""
@@ -616,6 +700,7 @@ class LoxoneBaseConnection:
         """
         self.scheme = scheme
         self.url = url
+        self._hostname = urlparse(f"//{url}").hostname or self._hostname
         _LOGGER.debug("URL updated to %s://%s", scheme, url)
 
     def _websocket_ssl_context(self) -> ssl.SSLContext | None:
@@ -679,6 +764,8 @@ class LoxoneBaseConnection:
                 "valid_until": self._token.valid_until,
                 "hash_alg": self._token.hash_alg,
                 "unsecure_password": self._token.unsecure_password,
+                "client_uuid": self.client_uuid,
+                "public_key_pin": self.public_key_pin,
             }
         except AttributeError as e:
             _LOGGER.error(f"Token attributes missing: {e}")
@@ -729,30 +816,24 @@ class LoxoneBaseConnection:
         Salt rotation
         -------------
 
-        ``self._salt`` (a 16-byte hex string) is the **server-side
-        pre-shared salt** sent to the Miniserver with every
-        encrypted command so the Miniserver can derive the same
-        session key. ``_new_salt_needed()`` decides when to
-        rotate:
+        ``self._salt`` (a 16-byte hex string) is sent with every
+        encrypted command. The spec advises a new salt after every
+        sent command (replay protection), so ``_new_salt_needed()``
+        returns ``True`` once the current salt was used
+        (``SALT_MAX_USE_COUNT`` = 1; ``SALT_MAX_AGE_SECONDS`` stays as
+        an upper bound). The first command after ``open()`` uses
+        ``salt/{salt}/{command}``, every later one
+        ``nextSalt/{old}/{new}/{command}``. The trailing NUL byte
+        (``\\x00``) after ``{command}`` is undocumented but required
+        by the Miniserver's command parser.
 
-          - ``SALT_MAX_USE_COUNT`` — rotate after this many uses
-            of the current salt.
-          - ``SALT_MAX_AGE_SECONDS`` — rotate after this many
-            seconds since ``_generate_salt`` last ran.
-
-        When a rotation is due, the new salt is sent to the
-        Miniserver via a ``nextSalt/{old}/{new}/{command}``
-        command (the old salt is included so the Miniserver can
-        validate the rotation). The trailing NUL byte
-        (``\\x00``) after ``{command}`` is undocumented but
-        required by the Miniserver's command parser.
-
-        The decision and the generation run under
-        ``self._salt_lock`` (see ``__init__``) because the send
-        path is concurrent: the queue consumer spawns one task per
-        message and ``open()`` / token refresh call this method
-        directly. The lock is released before the AES work and the
-        websocket send, so it never covers I/O.
+        The decision, the AES work and the send run under
+        ``self._salt_lock`` (see ``__init__``): the send path is
+        concurrent (the queue consumer spawns one task per message,
+        ``open()`` / token refresh call this method directly), and
+        the Miniserver accepts a rotation only when ``old`` is its
+        current salt, so the wire order must follow the rotation
+        order. The new salt is kept only after a successful send.
 
         Hash algorithm fallback
         -----------------------
@@ -802,29 +883,41 @@ class LoxoneBaseConnection:
         # decision and the AES work happen in between.
         connection = self.connection
         if encrypted:
-            # Salt state (``_salt`` / ``_salt_used_count``) is shared
-            # across every concurrent send task, so decide + generate
-            # atomically. Without the lock a second sender could decide
-            # while a rotation is in flight and build its command with
-            # a salt the Miniserver has not (or already) switched to.
-            # Only the decision lives inside the lock: the AES work and
-            # the websocket send below stay outside, so the critical
-            # section never waits on I/O and the send pipeline keeps
-            # its fire-and-forget throughput.
+            # The salt changes after every command (spec), and the
+            # Miniserver accepts ``nextSalt/{prev}/{next}`` only when
+            # ``prev`` is its current salt. Senders run as concurrent
+            # tasks, so the decision, the AES work and the send all run
+            # under the lock: otherwise two rotations could reach the
+            # wire in the wrong order and break the chain. The new salt
+            # is kept only after the send succeeded, so a command that
+            # never left does not move our salt past the Miniserver's.
             async with self._salt_lock:
                 if self._new_salt_needed():
-                    old_salt = self._salt
-                    self._generate_salt()
+                    new_salt = get_random_bytes(SALT_BYTES).hex()
                     # The miniserver needs the text terminated with a zero byte,
                     # though this is not documented
-                    command_string = f"nextSalt/{old_salt}/{self._salt}/{command}\x00"
+                    command_string = f"nextSalt/{self._salt}/{new_salt}/{command}\x00"
                 else:
+                    new_salt = None
                     command_string = f"salt/{self._salt}/{command}\x00"
-            padded_bytes = Padding.pad(bytes(command_string, "utf-8"), 16)
-            aes_cipher = AES.new(self._aes_key, AES.MODE_CBC, self._iv)
-            cipher = b64encode(aes_cipher.encrypt(padded_bytes))
-            enc_cipher = urllib.parse.quote(cipher.decode())
-            command = f"jdev/sys/enc/{enc_cipher}"
+                await self._send_on(connection, self._encrypt_command(command_string))
+                if new_salt is not None:
+                    self._set_salt(new_salt)
+                    # Announced with this command, so already used once:
+                    # the next command rotates again.
+                    self._salt_used_count = 1
+            return
+        await self._send_on(connection, command)
+
+    def _encrypt_command(self, command_string: str) -> str:
+        """``jdev/sys/enc/{cipher}`` for ``command_string`` (AES-CBC, session key)."""
+        padded_bytes = Padding.pad(bytes(command_string, "utf-8"), 16)
+        aes_cipher = AES.new(self._aes_key, AES.MODE_CBC, self._iv)
+        cipher = b64encode(aes_cipher.encrypt(padded_bytes))
+        return f"jdev/sys/enc/{urllib.parse.quote(cipher.decode())}"
+
+    @staticmethod
+    async def _send_on(connection, command: str) -> None:
         try:
             # Send a plain str (not a list): websockets fragments the
             # payload when given a list, which the Loxone protocol does
@@ -854,12 +947,15 @@ class LoxoneBaseConnection:
         # The miniserver seems to terminate the text with a zero byte
         return _strip_padding(decrypted).rstrip(b"\x00")
 
+    def _set_salt(self, salt: str) -> None:
+        self._salt = salt
+        self._salt_time_stamp = time_elapsed_in_seconds()
+        self._salt_used_count = 0
+
     def _generate_salt(self) -> None:
         try:
             _LOGGER.debug("Generating a new salt")
-            self._salt = get_random_bytes(SALT_BYTES).hex()
-            self._salt_time_stamp = time_elapsed_in_seconds()
-            self._salt_used_count = 0
+            self._set_salt(get_random_bytes(SALT_BYTES).hex())
         except Exception as e:
             _LOGGER.error(f"Failed to generate salt: {e}")
             raise RuntimeError(f"Salt generation failed: {e}") from e
@@ -948,6 +1044,70 @@ class LoxoneBaseConnection:
             finally:
                 if self._key_update_event is key_updated_event:
                     self._key_update_event = None
+
+    def _stored_client_uuid(self, token: Optional[dict]) -> Optional[str]:
+        """The client uuid from ``token=`` or the token store, if any."""
+        if token is not None:
+            value = token.get("client_uuid") if isinstance(token, dict) else None
+            return value if is_loxone_uuid(value) else None
+        if self._token_store is None:
+            return None
+        try:
+            return client_uuid_from_store(
+                self._token_store.load(), self._token_binding
+            )
+        except Exception as e:
+            _LOGGER.warning("token_store.load failed while reading client_uuid: %s", e)
+            return None
+
+    @staticmethod
+    def _new_client_uuid() -> str:
+        """A random uuid in the form the Miniserver expects (8-4-4-16)."""
+        h = uuid.uuid4().hex
+        return f"{h[:8]}-{h[8:12]}-{h[12:16]}-{h[16:]}"
+
+    def _token_request_command(self, credential_hash: str) -> str:
+        """``getjwt`` (``gettoken`` before 10.2) with this client's parameters."""
+        cmd = (
+            CMD_REQUEST_TOKEN
+            if self.miniserver_version < [10, 2]
+            else CMD_REQUEST_TOKEN_JSON_WEB
+        )
+        return (
+            f"{cmd}/{credential_hash}/{self._encoded_username}/"
+            f"{self.token_permission}/{self.client_uuid}/"
+            f"{percent_encode_credential(self.client_info)}"
+        )
+    def _stored_pin(self, token: Optional[dict]) -> Optional[str]:
+        """The pin from ``token=`` or the token store, if any."""
+        if token is not None:
+            return normalise_pin(token.get("public_key_pin")) if isinstance(token, dict) else None
+        if self._token_store is None:
+            return None
+        try:
+            return pin_from_store(self._token_store.load(), self._token_binding)
+        except Exception as e:
+            _LOGGER.warning("token_store.load failed while reading public_key_pin: %s", e)
+            return None
+
+    def _check_public_key_pin(self, rsa_key) -> None:
+        """Compare the key with the pin; learn the pin on first use."""
+        pin = "sha256:" + hashlib.sha256(rsa_key.export_key("DER")).hexdigest()
+        if self.public_key_pin is None:
+            self.public_key_pin = pin
+            _LOGGER.info("Pinned the Miniserver public key (%s)", pin)
+            # With a stored token the login uses authwithtoken and saves
+            # no new token, so save the pin now. Without one, it is saved
+            # with the token of this session's getjwt.
+            if self._token.token:
+                self._save_token_to_store(self.get_token_dict())
+            return
+        if pin != self.public_key_pin:
+            raise LoxonePublicKeyMismatchError(
+                "The Miniserver presented a different public key than the pinned "
+                f"one (got {pin}, pinned {self.public_key_pin}). If the Miniserver "
+                "was replaced or reset, connect with the new public_key_pin."
+            )
 
     def _load_from_token_store(self) -> LoxoneToken:
         """Read the stored token; any problem means "no token"."""
@@ -1334,8 +1494,11 @@ class LoxoneConnection(LoxoneBaseConnection):
             _LOGGER.debug("Opening the deferred websocket connection.")
             await self._connect_websocket()
         elif self.connection is None:
+            # Reconnect: HTTP bootstrap and websocket in one go. The
+            # structure file is loaded on this session after the login.
             _LOGGER.debug("No existing connection found. Opening a new connection.")
-            await self.open()
+            await self._http_bootstrap()
+            await self._connect_websocket()
         else:
             _LOGGER.debug("Using existing connection.")
 
@@ -1758,6 +1921,123 @@ class LoxoneConnection(LoxoneBaseConnection):
         # (it would be confusing to see "Connection restored"
         # before any "Connection lost").
 
+    async def _after_login(self) -> None:
+        """Load the structure file, then report the session as usable.
+
+        Runs once per session after a successful login. The file is
+        loaded before "connected" is reported and before state updates
+        are enabled, so callbacks see the structure of this session. In
+        the bootstrap session of :meth:`open` the session ends here.
+        """
+        try:
+            if self._structure_fresh and not self._bootstrap_session:
+                # ``open()`` loaded it a moment ago.
+                self._structure_fresh = False
+            else:
+                await self._download_structure_file()
+        except Exception as e:
+            _LOGGER.warning("Could not load the structure file: %s", e)
+            if self._bootstrap_session:
+                # ``open()`` raises it as it is.
+                self._bootstrap_error = e
+                if self._bootstrap_done is not None:
+                    self._bootstrap_done.set()
+                return
+            # Ending the socket ends the session; ``run()`` reconnects.
+            connection = self.connection
+            if connection is not None:
+                await connection.close()
+            return
+        if self._bootstrap_session:
+            self._structure_fresh = True
+            if self._bootstrap_done is not None:
+                self._bootstrap_done.set()
+            return
+        await self._on_authenticated()
+        await self._message_queue.put(
+            MessageForQueue(f"{CMD_ENABLE_UPDATES}", True)
+        )
+
+    async def _download_structure_file(self) -> None:
+        """Fill ``structure_file`` for this session.
+
+        A kept file (in memory, else from ``structure_cache``) is used when
+        its ``lastModified`` equals the Miniserver's
+        ``jdev/sps/LoxAPPversion3``; otherwise ``data/LoxAPP3.json`` is
+        downloaded over the websocket and handed to the cache.
+        """
+        kept = self.structure_file if self.structure_file.get("lastModified") else None
+        if kept is None:
+            kept = await self._load_cached_structure()
+        if kept is not None:
+            version = await self._request_structure_version()
+            if version is not None and version == str(kept.get("lastModified")):
+                _LOGGER.debug("Structure file unchanged (%s); not downloading", version)
+                kept["softwareVersion"] = self.miniserver_version  # FIXME Legacy use only
+                self.structure_file = kept
+                return
+
+        waiter = asyncio.get_running_loop().create_future()
+        self._structure_waiter = waiter
+        try:
+            await self._send_text_command(CMD_GET_STRUCTURE_FILE, encrypted=False)
+            data = await asyncio.wait_for(waiter, timeout=STRUCTURE_FILE_TIMEOUT)
+        finally:
+            self._structure_waiter = None
+        try:
+            # Often a few megabytes: parse off the event loop when an
+            # executor was supplied (Home Assistant passes
+            # ``hass.async_add_executor_job``).
+            structure = await self._run_blocking(json.loads, data)
+        except json.JSONDecodeError as e:
+            raise ValueError(f"Invalid JSON in structure file: {e}") from e
+        if not isinstance(structure, dict):
+            raise ValueError("Structure file is not a JSON object")
+        await self._save_cached_structure(structure)
+        structure["softwareVersion"] = self.miniserver_version  # FIXME Legacy use only
+        self.structure_file = structure
+
+    async def _request_structure_version(self) -> Optional[str]:
+        """``jdev/sps/LoxAPPversion3`` reply value, or ``None`` if none came."""
+        waiter = asyncio.get_running_loop().create_future()
+        self._version_waiter = waiter
+        try:
+            await self._send_text_command(CMD_GET_STRUCTURE_VERSION, encrypted=False)
+            return str(await asyncio.wait_for(waiter, timeout=STRUCTURE_VERSION_TIMEOUT))
+        except (asyncio.TimeoutError, TimeoutError):
+            _LOGGER.debug(
+                "No reply to %s; downloading the structure file",
+                CMD_GET_STRUCTURE_VERSION,
+            )
+            return None
+        finally:
+            self._version_waiter = None
+
+    async def _run_blocking(self, target, *args):
+        """Run ``target`` through the executor if one was supplied."""
+        if self.executor is not None:
+            return await self.executor(target, *args)
+        return target(*args)
+
+    async def _load_cached_structure(self) -> Optional[dict]:
+        if self._structure_cache is None:
+            return None
+        try:
+            data = await self._run_blocking(self._structure_cache.load)
+        except Exception as e:
+            _LOGGER.warning("structure_cache.load failed: %s", e)
+            return None
+        return cached_structure_for(data, self.miniserver_serial)
+
+    async def _save_cached_structure(self, structure: dict) -> None:
+        if self._structure_cache is None:
+            return
+        try:
+            # A copy: the library adds keys (softwareVersion) to its own.
+            await self._run_blocking(self._structure_cache.save, dict(structure))
+        except Exception as e:
+            _LOGGER.warning("structure_cache.save failed: %s", e, exc_info=True)
+
     async def _on_authenticated(self) -> None:
         """This session has logged in (authwithtoken / gettoken / getjwt).
 
@@ -2088,6 +2368,15 @@ class LoxoneConnection(LoxoneBaseConnection):
             msg_type = header.message_type
             if msg_type == MessageType.TEXT:
                 body = check_and_decode_if_needed(body)
+                waiter = self._structure_waiter
+                if (
+                    waiter is not None
+                    and not waiter.done()
+                    and not _LL_ENVELOPE.match(body)
+                ):
+                    # The structure file: a JSON document, not an LL reply.
+                    waiter.set_result(body)
+                    return
             try:
                 parsed_message = parse_message(body, msg_type)
             except Exception as e:
@@ -2372,6 +2661,52 @@ class LoxoneConnection(LoxoneBaseConnection):
         assert last_exc is not None
         raise last_exc
 
+    def _apply_api_key_info(self, value: dict) -> None:
+        """Take serial number and ``httpsStatus`` from the apiKey reply."""
+        self.miniserver_serial = value.get("snr", "") or ""
+        raw = value.get("httpsStatus")
+        try:
+            self.https_status = None if raw is None else int(raw)
+        except (TypeError, ValueError):
+            self.https_status = None
+
+        if self.https_status == 2:
+            _LOGGER.warning(
+                "The Miniserver's TLS certificate has expired (httpsStatus 2)"
+            )
+        elif (
+            self.https_status == 1
+            and self.scheme == "http"
+            and not self._https_hint_logged
+        ):
+            self._https_hint_logged = True
+            target = self.tls_hostname
+            _LOGGER.info(
+                "The Miniserver supports HTTPS/WSS, but the connection uses "
+                "plain HTTP/WS%s",
+                f"; for TLS connect to https://{target}" if target else "",
+            )
+
+    @property
+    def tls_hostname(self) -> str | None:
+        """CloudDNS host name for a TLS connection to this Miniserver.
+
+        Built as in the spec ("How can I connect locally with TLS?"):
+        ``{ip with dashes}.{serial}.dyndns.loxonecloud.com``. Only for an IP
+        literal host, a known serial and ``https_status == 1``. The
+        certificate matches only when the Miniserver uses the CloudDNS
+        certificate; locally the HTTPS port is usually 443.
+        """
+        if self.https_status != 1 or not self.miniserver_serial:
+            return None
+        try:
+            ip = ipaddress.ip_address(self._hostname)
+        except ValueError:
+            return None
+        cleaned = str(ip).replace(".", "-").replace(":", "-")
+        snr = self.miniserver_serial.replace(":", "").upper()
+        return f"{cleaned}.{snr}.dyndns.loxonecloud.com"
+
     def _check_local_only(self, local: bool) -> None:
         """Refuse a remote Miniserver when ``local_only`` is set (final)."""
         if not local and self.local_only:
@@ -2403,18 +2738,38 @@ class LoxoneConnection(LoxoneBaseConnection):
         *,
         connect_websocket: bool = True,
     ) -> LoxoneClientConnection | None:
-        """Bootstrap over HTTP and (by default) open the websocket.
+        """Bootstrap, load the structure file and (by default) open the websocket.
 
-        With ``connect_websocket=False`` only the HTTP bootstrap and
-        the session-key generation run; ``structure_file`` is
-        available afterwards, and the websocket is opened by the next
-        :meth:`start_listening` right before the key exchange. Use
-        this when there is a delay between bootstrap and listening
-        (e.g. Home Assistant setting up its platforms): the Miniserver
-        closes a websocket that is not authenticated within a few
-        seconds (issue #527).
+        The HTTP bootstrap (apiKey, cfg/api, public key) carries no
+        credentials. The structure file is loaded over a short websocket
+        session: key exchange, login, ``data/LoxAPP3.json``, close. So
+        ``structure_file`` is filled when this returns, and no login
+        information goes over the wire in plain text.
+
+        With ``connect_websocket=False`` the websocket for listening is
+        opened by the next :meth:`start_listening`, right before its key
+        exchange (issue #527: the Miniserver closes a websocket that is
+        not authenticated within a few seconds). That session does not
+        load the structure file again.
         """
+        if self._closed:
+            raise RuntimeError("Cannot open a closed connection")
 
+        await self._http_bootstrap(session)
+        await self._load_structure_via_session()
+
+        if not connect_websocket:
+            self._websocket_deferred = True
+            return None
+        return await self._connect_websocket()
+
+    async def _http_bootstrap(
+        self, session: aiohttp.ClientSession | None = None
+    ) -> None:
+        """apiKey, cfg/api and public key over HTTP, then the session key.
+
+        None of these requests needs credentials, so none are sent.
+        """
         if self._closed:
             raise RuntimeError("Cannot open a closed connection")
 
@@ -2422,8 +2777,6 @@ class LoxoneConnection(LoxoneBaseConnection):
         try:
             connector = LoxoneAsyncHttpClient(
                 url=self.url,
-                username=self.username,
-                password=self.password,
                 scheme=self.scheme,
                 verify_ssl=self.verify_ssl,
                 session=session,
@@ -2472,7 +2825,7 @@ class LoxoneConnection(LoxoneBaseConnection):
                 _LOGGER.warning("No version in API response")
                 self.miniserver_version = []
 
-            self.miniserver_serial = value.get("snr", "")
+            self._apply_api_key_info(value)
             local = value.get("local", True)
 
             self._check_local_only(local)
@@ -2488,31 +2841,7 @@ class LoxoneConnection(LoxoneBaseConnection):
                 except Exception as e:
                     _LOGGER.warning(f"Failed to update URL for remote access: {e}")
 
-            # Get the structure file.  Use ``_get_with_retry`` so a
-            # transient network blip during the structure-file fetch
-            # doesn't fail the whole open().
             await self._check_event_slots(connector)
-
-            data, _ = await self._get_with_retry(LOXAPPPATH, connector)
-
-            try:
-                # ``LoxAPP3.json`` is the full Miniserver structure
-                # file — often a few megabytes. Run ``json.loads`` off
-                # the event loop when an executor was supplied (the
-                # coordinator passes ``hass.async_add_executor_job``).
-                if self.executor is not None:
-                    self.structure_file = await self.executor(
-                        json.loads, data
-                    )
-                else:
-                    self.structure_file = json.loads(data)
-                self.structure_file["softwareVersion"] = (
-                    self.miniserver_version
-                )  # FIXME Legacy use only. Need to fix pyloxone
-            except json.JSONDecodeError as e:
-                raise ValueError(f"Invalid JSON in structure file: {e}") from e
-            except Exception as e:
-                raise RuntimeError(f"Failed to read structure file: {e}") from e
 
             # Get the public key.  Same retry helper as above.
             pk_data_text, _ = await self._get_with_retry(
@@ -2568,6 +2897,8 @@ class LoxoneConnection(LoxoneBaseConnection):
             _LOGGER.error(f"Error creating RSA cipher: {exc}")
             raise LoxoneException(f"RSA cipher initialization failed: {exc}") from exc
 
+        self._check_public_key_pin(rsa_key)
+
         # Generate session key
         try:
             if not self._aes_key or not self._iv:
@@ -2590,10 +2921,77 @@ class LoxoneConnection(LoxoneBaseConnection):
             _LOGGER.error(f"Error generating session key: {exc}")
             raise LoxoneException(f"Session key generation failed: {exc}") from exc
 
-        if not connect_websocket:
-            self._websocket_deferred = True
-            return None
-        return await self._connect_websocket()
+    async def _load_structure_via_session(self) -> None:
+        """Log in on a short websocket session and load the structure file.
+
+        Runs the normal session machinery of :meth:`start_listening` in
+        bootstrap mode: after the login, ``_after_login`` loads the file
+        and sets ``_bootstrap_done`` instead of enabling state updates.
+        The session is then torn down without reporting "connected".
+
+        A rejected stored token ends the first session with
+        ``LoxoneTokenError`` after the token was dropped; one more session
+        then logs in with the password.
+        """
+        try:
+            await self._run_bootstrap_session()
+        except LoxoneTokenError:
+            _LOGGER.debug("Stored token rejected; bootstrap logs in with the password")
+            await self._run_bootstrap_session()
+
+    async def _run_bootstrap_session(self) -> None:
+        self._bootstrap_session = True
+        self._bootstrap_error = None
+        self._bootstrap_done = asyncio.Event()
+        self._websocket_deferred = True
+        listen = asyncio.create_task(
+            self.start_listening(callback=None), name="loxone.bootstrap-session"
+        )
+        done_wait = asyncio.create_task(self._bootstrap_done.wait())
+        try:
+            finished, _ = await asyncio.wait(
+                {listen, done_wait},
+                timeout=STRUCTURE_FILE_TIMEOUT + (self.timeout or TIMEOUT) * 2,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if done_wait in finished:
+                if self._bootstrap_error is not None:
+                    raise self._bootstrap_error
+                return
+            if listen in finished:
+                exc = listen.exception()
+                if exc is not None and not isinstance(exc, LoxoneConnectionClosedOk):
+                    raise exc
+                raise LoxoneConnectionError(
+                    "Websocket session ended before the structure file arrived"
+                )
+            raise LoxoneConnectionError(
+                "Timeout loading the structure file over the websocket"
+            )
+        finally:
+            done_wait.cancel()
+            if not listen.done():
+                listen.cancel()
+            await asyncio.gather(listen, done_wait, return_exceptions=True)
+            await self._end_session_quietly()
+            self._bootstrap_session = False
+
+    async def _end_session_quietly(self) -> None:
+        """Stop the session tasks and close the websocket, keeping the
+        instance reusable (unlike :meth:`close`)."""
+        tasks = [t for t in self._pending_task if t and not t.done()]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._pending_task = []
+        connection, self.connection = self.connection, None
+        if connection is not None:
+            try:
+                await asyncio.wait_for(connection.close(), timeout=WEBSOCKET_CLOSE_TIMEOUT)
+            except Exception as e:
+                _LOGGER.debug("Closing the bootstrap websocket failed: %s", e)
+        self._authenticated_event.clear()
 
     async def _connect_websocket(self) -> LoxoneClientConnection:
         """Open the websocket after a completed :meth:`open` bootstrap.
@@ -2761,6 +3159,7 @@ class LoxoneConnection(LoxoneBaseConnection):
         # A reconnect after this close re-runs the full ``open()``
         # bootstrap, as before the websocket could be deferred.
         self._websocket_deferred = False
+        self._structure_fresh = False
 
         # Drop any pending secure commands — they would never reach
         # the Miniserver and any stale visual hash should not be
@@ -3089,8 +3488,14 @@ class LoxoneConnection(LoxoneBaseConnection):
                     _LOGGER.error(f"Failed to decrypt control message: {e}")
                     return
 
+            # Reply to jdev/sps/LoxAPPversion3: hand the version to the waiter.
+            if isinstance(mess_obj, TextMessage) and "LoxAPPversion3" in mess_obj.message:
+                waiter = self._version_waiter
+                if waiter is not None and not waiter.done():
+                    waiter.set_result(mess_obj.value)
+
             # Handle key exchange
-            if isinstance(mess_obj, TextMessage) and "keyexchange" in mess_obj.message:
+            elif isinstance(mess_obj, TextMessage) and "keyexchange" in mess_obj.message:
                 _LOGGER.debug("Key exchange with miniserver...")
                 command = f"{CMD_GET_KEY_AND_SALT}/{self._encoded_username}"
                 try:
@@ -3133,10 +3538,7 @@ class LoxoneConnection(LoxoneBaseConnection):
                             raise RuntimeError("Failed to hash credentials")
 
                         # Request new Token
-                        if self.miniserver_version < [10, 2]:
-                            command = f"{CMD_REQUEST_TOKEN}/{new_hash}/{self._encoded_username}/{TOKEN_PERMISSION}/edfc5f9a-df3f-4cad-9dddcdc42c732b82/pyloxone_api"
-                        else:
-                            command = f"{CMD_REQUEST_TOKEN_JSON_WEB}/{new_hash}/{self._encoded_username}/{TOKEN_PERMISSION}/edfc5f9a-df3f-4cad-9dddcdc42c732b82/pyloxone_api"
+                        command = self._token_request_command(new_hash)
                         await self._message_queue.put(MessageForQueue(command, True))
 
                 except LoxoneUnauthorisedError:
@@ -3241,20 +3643,14 @@ class LoxoneConnection(LoxoneBaseConnection):
                     if not self._token.token:
                         raise ValueError("Received empty token")
 
-                    # Signal the refresh loop that the token is
-                    # now populated. ``check_refresh_token`` was
-                    # blocked on this event; it can now start its
-                    # 50%-of-lifetime countdown.
-                    await self._on_authenticated()
-
                     # Notify the integration (e.g. the HA
                     # coordinator) that the token changed so it
                     # can persist the new value.
                     self._signal_token_changed()
 
-                    await self._message_queue.put(
-                        MessageForQueue(f"{CMD_ENABLE_UPDATES}", True)
-                    )
+                    # Structure file, then "connected" (which wakes the
+                    # refresh loop) and state updates.
+                    await self._after_login()
 
                 except LoxoneUnauthorisedError:
                     # Hard credential rejection — must reach the
@@ -3288,10 +3684,11 @@ class LoxoneConnection(LoxoneBaseConnection):
                         # loop and manual refresh service just as the
                         # gettoken/getjwt handler does.
                         if mess_obj.code == 200:
-                            await self._on_authenticated()
-                        await self._message_queue.put(
-                            MessageForQueue(f"{CMD_ENABLE_UPDATES}", True)
-                        )
+                            await self._after_login()
+                        else:
+                            await self._message_queue.put(
+                                MessageForQueue(f"{CMD_ENABLE_UPDATES}", True)
+                            )
                     except asyncio.TimeoutError:
                         _LOGGER.error("Timeout queueing authwithtoken command")
 
