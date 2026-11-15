@@ -56,6 +56,8 @@ from .structure_cache import StructureCache, cached_structure_for
 from .token_store import (TokenStore, client_uuid_from_store, is_loxone_uuid,
                           make_binding, normalise_pin, pin_from_store,
                           token_from_store)
+from .remote_connect import (REMOTE_CONNECT_HOST, remote_connect_serial,
+                             resolve_remote_address)
 from .exceptions import (LoxoneAuthEscalatedError,
                          LoxoneNoEventSlotsError, LoxoneRemoteAccessDeniedError,
                          LoxoneConnectionClosedOk, LoxoneConnectionError,
@@ -551,6 +553,17 @@ class LoxoneBaseConnection:
             self.url = f"{netloc}:{used_port}{parsed.path}"
         else:
             self.url = f"{netloc}{parsed.path}"
+
+        # Remote Connect (spec V17.0): connect.loxonecloud.com/{serial}
+        # (or the deprecated dns.loxonecloud.com/{serial}). The relay
+        # address is resolved on every open(); the URL kept here is
+        # the stable identity (token binding). HTTPS/WSS only.
+        self.remote_serial: Optional[str] = remote_connect_serial(host)
+        if self.remote_serial is not None:
+            if local_only:
+                raise ValueError("local_only cannot be combined with a Remote Connect host")
+            self.scheme = "https"
+            self.url = f"{REMOTE_CONNECT_HOST}/{self.remote_serial}"
 
         # Generate random 16 byte AES initialisation vector (iv)
         try:
@@ -2775,6 +2788,12 @@ class LoxoneConnection(LoxoneBaseConnection):
 
         connector = None
         try:
+            if self.remote_serial is not None:
+                # The relay can change between connections: ask again.
+                address = await resolve_remote_address(
+                    self.remote_serial, session, timeout=self.timeout or 10
+                )
+                self._apply_url(address.scheme, address.url)
             connector = LoxoneAsyncHttpClient(
                 url=self.url,
                 scheme=self.scheme,
