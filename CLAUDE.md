@@ -30,8 +30,9 @@ existing findings (mostly E501). New files should be clean.
 - `src/pyloxone_api/connection.py`: the core. Connection, login, the `run()`
   supervisor, commands, tokens, preflight.
 - `src/pyloxone_api/token_store.py`: the `TokenStore` protocol and validation of stored tokens.
+- `src/pyloxone_api/structure_cache.py`: the `StructureCache` protocol (optional persistence of LoxAPP3.json).
 - `src/pyloxone_api/const.py`, `exceptions.py`: constants and exceptions.
-- `src/pyloxone_api/loxone_http_client.py`: HTTP requests (bootstrap, structure file).
+- `src/pyloxone_api/loxone_http_client.py`: HTTP requests of the bootstrap (no credentials).
 - `docs/CALLBACKS.md`, `docs/TOKEN-STORE.md`: public documentation.
 - `release.md`: the release procedure.
 
@@ -85,6 +86,17 @@ existing findings (mostly E501). New files should be clean.
   advises for apps; `token_permission=2` keeps the old web token. Each client
   sends its own `client_uuid` (generated, saved with the token) instead of
   one hard-coded uuid for every installation.
+- No credentials go over HTTP. The bootstrap requests (apiKey, cfg/api,
+  getPublicKey) need none; the structure file is loaded over the websocket
+  after the login (`_after_login`). `open()` runs a short bootstrap session
+  for it, so `structure_file` is filled when `open()` returns; the next
+  listening session skips the download (`_structure_fresh`). A rejected
+  stored token in that session is dropped and the bootstrap logs in once
+  more with the password.
+- The Miniserver public key is pinned on first use (`public_key_pin`, saved
+  with the token). Loxone does not publish its root certificate, so the
+  chain check the spec describes is not possible; a different key later
+  raises `LoxonePublicKeyMismatchError`, which is final.
 - The source distribution excludes internal notes (`[tool.hatch.build.targets.sdist]`).
   Internal notes do not belong in the repository.
 
