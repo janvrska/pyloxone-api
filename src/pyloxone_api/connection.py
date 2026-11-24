@@ -2725,8 +2725,10 @@ class LoxoneConnection(LoxoneBaseConnection):
             ip = ipaddress.ip_address(self._hostname)
         except ValueError:
             return None
+        if getattr(ip, "scope_id", None):
+            return None
         cleaned = str(ip).replace(".", "-").replace(":", "-")
-        snr = self.miniserver_serial.replace(":", "").upper()
+        snr = self.miniserver_serial.replace(":", "").replace("-", "").strip().upper()
         return f"{cleaned}.{snr}.dyndns.loxonecloud.com"
 
     def _check_local_only(self, local: bool) -> None:
@@ -2853,7 +2855,6 @@ class LoxoneConnection(LoxoneBaseConnection):
                 _LOGGER.warning("No version in API response")
                 self.miniserver_version = []
 
-            self._apply_api_key_info(value)
             local = value.get("local", True)
 
             self._check_local_only(local)
@@ -2868,6 +2869,9 @@ class LoxoneConnection(LoxoneBaseConnection):
                         self._apply_url(new_scheme, new_host)
                 except Exception as e:
                     _LOGGER.warning(f"Failed to update URL for remote access: {e}")
+
+            # After the redirect: the HTTPS hint depends on the final scheme.
+            self._apply_api_key_info(value)
 
             await self._check_event_slots(connector)
 
